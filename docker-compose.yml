@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg16
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: ada
+      POSTGRES_USER: ada
+      POSTGRES_PASSWORD: ada_local
+    volumes:
+      - ada_pgdata:/var/lib/postgresql/data
+      - ./ada/memory/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    command: postgres -c shared_preload_libraries='timescaledb'
+    restart: unless-stopped
+
+volumes:
+  ada_pgdata:
