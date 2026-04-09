@@ -40,8 +40,12 @@ class CloudConfig:
 
 @dataclass
 class TTSConfig:
-    primary: str = "none"
-    fallback: str = "none"
+    primary: str = "cloud"              # Microsoft Azure TTS (cloud API)
+    fallback: str = "kokoro"            # Kokoro CPU fallback
+    # Microsoft Azure Speech Service
+    azure_speech_key: str = os.environ.get("AZURE_SPEECH_KEY", "")
+    azure_speech_region: str = os.environ.get("AZURE_SPEECH_REGION", "eastus")
+    azure_voice: str = "en-US-AvaMultilingualNeural"  # Natural conversational voice
 
 
 @dataclass
@@ -68,14 +72,14 @@ class BudgetConfig:
 
 @dataclass
 class DatabaseConfig:
-    """SQLite — fields kept for API compat."""
+    """PostgreSQL via Docker (docker compose up -d)."""
     host: str = "localhost"
-    port: int = 0
+    port: int = 5432
     database: str = "ada"
-    user: str = ""
-    password: str = ""
-    min_pool_size: int = 1
-    max_pool_size: int = 1
+    user: str = "ada"
+    password: str = os.environ.get("POSTGRES_PASSWORD", "ada_local")
+    min_pool_size: int = 2
+    max_pool_size: int = 10
 
 
 @dataclass
@@ -87,8 +91,8 @@ class OllamaConfig:
 
 @dataclass
 class VoiceConfig:
-    enabled: bool = False
-    stt_model: str = ""
+    enabled: bool = True
+    stt_model: str = "base"             # faster-whisper base (150MB, runs on CPU)
     wake_word: str = "hey ada"
     attentive_timeout_sec: int = 120
     ack_deadline_ms: int = 1000

@@ -1,27 +1,22 @@
-"""SQLite store — zero-infra replacement for PostgreSQL.
+"""PostgreSQL store — async connection pool + query methods for all memory types.
 
-AdaWindOS: All data stored in a single SQLite file. No Docker, no pgvector,
-no TimescaleDB. Vector search uses numpy cosine similarity.
-
-All public methods are async for API compatibility with the original store.
+All public methods handle connection errors gracefully:
+- Log the error with context (which operation, what data)
+- Raise StoreError so callers can decide how to degrade
+- Connection pool auto-reconnects on next healthy query
 """
 
 import json
 import logging
-import os
-import sqlite3
-from datetime import datetime, date
-from pathlib import Path
+from datetime import datetime
 from typing import Any
 
-import numpy as np
+import asyncpg
 
 from ..config import DatabaseConfig
 from .models import Task, Note, Episode, Memory, Entity, Relation, JournalEntry, OutboxEvent, Session
 
 log = logging.getLogger(__name__)
-
-DATA_DIR = Path(os.environ.get("ADA_DATA_DIR", Path.home() / ".ada" / "data"))
 
 
 class StoreError(Exception):
@@ -29,254 +24,97 @@ class StoreError(Exception):
     pass
 
 
-def _vec_to_bytes(embedding: list[float] | None) -> bytes | None:
-    """Convert embedding list to numpy bytes for storage."""
+def _vec(embedding: list[float] | str | None) -> str | None:
+    """Convert a Python list of floats to pgvector string format."""
     if embedding is None:
         return None
-    return np.array(embedding, dtype=np.float32).tobytes()
-
-
-def _bytes_to_vec(data: bytes | None) -> list[float] | None:
-    """Convert stored bytes back to embedding list."""
-    if data is None:
-        return None
-    return np.frombuffer(data, dtype=np.float32).tolist()
-
-
-def _cosine_similarity(a: list[float], b: bytes | None) -> float:
-    """Cosine similarity between a query vector and stored bytes."""
-    if b is None:
-        return 0.0
-    va = np.array(a, dtype=np.float32)
-    vb = np.frombuffer(b, dtype=np.float32)
-    dot = np.dot(va, vb)
-    norm = np.linalg.norm(va) * np.linalg.norm(vb)
-    if norm == 0:
-        return 0.0
-    return float(dot / norm)
+    if isinstance(embedding, str):
+        return embedding
+    return "[" + ",".join(str(f) for f in embedding) + "]"
 
 
 class Store:
-    def __init__(self, config: DatabaseConfig = None):
+    def __init__(self, config: DatabaseConfig):
         self.config = config
-        self.db: sqlite3.Connection | None = None
-        self._db_path = DATA_DIR / "ada.db"
+        self.pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
         try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            self.db = sqlite3.connect(str(self._db_path), check_same_thread=False)
-            self.db.row_factory = sqlite3.Row
-            self.db.execute("PRAGMA journal_mode=WAL")
-            self.db.execute("PRAGMA foreign_keys=ON")
-            self._create_tables()
-            log.info(f"Connected to SQLite at {self._db_path}")
-        except Exception as e:
-            log.error(f"Failed to connect to SQLite: {e}")
+            self.pool = await asyncpg.create_pool(
+                host=self.config.host,
+                port=self.config.port,
+                database=self.config.database,
+                user=self.config.user,
+                password=self.config.password,
+                min_size=self.config.min_pool_size,
+                max_size=self.config.max_pool_size,
+            )
+            log.info(f"Connected to PostgreSQL at {self.config.host}:{self.config.port}/{self.config.database}")
+        except (asyncpg.PostgresError, OSError) as e:
+            log.error(f"Failed to connect to PostgreSQL: {e}")
             raise StoreError(f"Database connection failed: {e}") from e
 
-    def _create_tables(self):
-        """Create all tables if they don't exist."""
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS episodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-                session_id TEXT,
-                turn_type TEXT,
-                speaker TEXT,
-                content TEXT,
-                embedding BLOB,
-                decision_event_id TEXT,
-                consolidated INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL,
-                memory_type TEXT,
-                confidence REAL DEFAULT 0.8,
-                source_episode_ids TEXT DEFAULT '[]',
-                embedding BLOB,
-                valid_from TEXT DEFAULT (datetime('now')),
-                valid_until TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS entities (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                entity_type TEXT,
-                embedding BLOB,
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS relations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                subject_id INTEGER REFERENCES entities(id),
-                predicate TEXT,
-                object_id INTEGER REFERENCES entities(id),
-                confidence REAL DEFAULT 0.8,
-                source_memory_id INTEGER,
-                valid_until TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY,
-                title TEXT,
-                type TEXT,
-                origin TEXT,
-                status TEXT DEFAULT 'queued',
-                priority INTEGER DEFAULT 5,
-                visibility TEXT DEFAULT 'internal',
-                owner TEXT,
-                created_by TEXT,
-                brief TEXT,
-                success_criteria TEXT DEFAULT '[]',
-                constraints TEXT DEFAULT '[]',
-                artifacts_expected TEXT DEFAULT '[]',
-                budget_class TEXT DEFAULT 'standard',
-                cloud_budget_limit INTEGER,
-                dispatch_target TEXT,
-                repo_path TEXT,
-                verdict TEXT,
-                result_summary TEXT,
-                error_message TEXT,
-                progress REAL,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS notes (
-                note_id TEXT PRIMARY KEY,
-                content TEXT,
-                type TEXT DEFAULT 'general',
-                status TEXT DEFAULT 'active',
-                priority INTEGER DEFAULT 5,
-                source TEXT,
-                owner TEXT DEFAULT 'daniel',
-                visibility TEXT DEFAULT 'personal',
-                confidence REAL DEFAULT 1.0,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS decision_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT UNIQUE,
-                timestamp TEXT,
-                sequence_num INTEGER,
-                source TEXT,
-                classification TEXT,
-                decision TEXT,
-                execution TEXT,
-                budget TEXT,
-                meta TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS journal (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT DEFAULT (datetime('now')),
-                action_type TEXT,
-                action_summary TEXT,
-                task_id TEXT,
-                agent TEXT,
-                band INTEGER,
-                budget_impact TEXT,
-                rollback_hint TEXT,
-                state_before TEXT,
-                state_after TEXT,
-                details TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS outbox_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                decision_event_id TEXT,
-                event_type TEXT,
-                payload TEXT,
-                status TEXT DEFAULT 'pending',
-                visible_at TEXT DEFAULT (datetime('now')),
-                created_at TEXT DEFAULT (datetime('now')),
-                processed_at TEXT,
-                attempt INTEGER DEFAULT 0,
-                max_attempts INTEGER DEFAULT 3,
-                error TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                started_at TEXT DEFAULT (datetime('now')),
-                ended_at TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id);
-            CREATE INDEX IF NOT EXISTS idx_episodes_consolidated ON episodes(consolidated);
-            CREATE INDEX IF NOT EXISTS idx_memories_valid ON memories(valid_until);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-            CREATE INDEX IF NOT EXISTS idx_notes_status ON notes(status);
-            CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_events(status, visible_at);
-            CREATE INDEX IF NOT EXISTS idx_journal_date ON journal(timestamp);
-        """)
-
-    def _ensure_db(self) -> sqlite3.Connection:
-        if self.db is None:
+    def _ensure_pool(self) -> asyncpg.Pool:
+        if self.pool is None:
             raise StoreError("Store not connected — call connect() first")
-        return self.db
+        return self.pool
+
+    async def _exec(self, operation: str, coro):
+        """Wrap a database operation with error handling and logging."""
+        pool = self._ensure_pool()
+        try:
+            return await coro
+        except asyncpg.PostgresError as e:
+            log.error(f"Database error in {operation}: {e}", exc_info=True)
+            raise StoreError(f"{operation} failed: {e}") from e
+        except asyncpg.InterfaceError as e:
+            log.error(f"Connection error in {operation}: {e} — pool may need reconnect", exc_info=True)
+            raise StoreError(f"{operation} connection failed: {e}") from e
 
     async def close(self) -> None:
-        if self.db:
-            self.db.close()
-            log.info("SQLite connection closed")
+        if self.pool:
+            await self.pool.close()
+            log.info("PostgreSQL connection pool closed")
 
     # --- Episodes ---
 
     async def insert_episode(self, ep: Episode) -> int:
-        db = self._ensure_db()
-        cur = db.execute(
+        return await self.pool.fetchval(
             """INSERT INTO episodes (timestamp, session_id, turn_type, speaker, content, embedding, decision_event_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (ep.timestamp or datetime.now().isoformat(), ep.session_id, ep.turn_type,
-             ep.speaker, ep.content, _vec_to_bytes(ep.embedding), ep.decision_event_id),
+               VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id""",
+            ep.timestamp, ep.session_id, ep.turn_type, ep.speaker,
+            ep.content, _vec(ep.embedding), ep.decision_event_id,
         )
-        db.commit()
-        return cur.lastrowid
 
     async def get_recent_episodes(self, session_id: str, limit: int = 20) -> list[dict]:
-        db = self._ensure_db()
-        rows = db.execute(
-            "SELECT * FROM episodes WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
-            (session_id, limit),
-        ).fetchall()
+        rows = await self.pool.fetch(
+            """SELECT * FROM episodes WHERE session_id = $1 ORDER BY timestamp DESC LIMIT $2""",
+            session_id, limit,
+        )
         return [dict(r) for r in reversed(rows)]
 
     async def get_unconsolidated_episodes(self, limit: int = 100) -> list[dict]:
-        db = self._ensure_db()
-        rows = db.execute(
-            "SELECT * FROM episodes WHERE consolidated = 0 ORDER BY timestamp ASC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = await self.pool.fetch(
+            """SELECT * FROM episodes WHERE consolidated = FALSE ORDER BY timestamp ASC LIMIT $1""",
+            limit,
+        )
         return [dict(r) for r in rows]
 
     async def mark_consolidated(self, episode_ids: list[int]) -> None:
-        db = self._ensure_db()
-        placeholders = ",".join("?" for _ in episode_ids)
-        db.execute(f"UPDATE episodes SET consolidated = 1 WHERE id IN ({placeholders})", episode_ids)
-        db.commit()
+        await self.pool.execute(
+            """UPDATE episodes SET consolidated = TRUE WHERE id = ANY($1)""",
+            episode_ids,
+        )
 
     # --- Memories (semantic) ---
 
     async def insert_memory(self, mem: Memory) -> int:
-        db = self._ensure_db()
-        source_ids = json.dumps(mem.source_episode_ids) if mem.source_episode_ids else "[]"
-        cur = db.execute(
+        return await self.pool.fetchval(
             """INSERT INTO memories (content, memory_type, confidence, source_episode_ids, embedding, valid_from)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (mem.content, mem.memory_type, mem.confidence,
-             source_ids, _vec_to_bytes(mem.embedding), mem.valid_from or datetime.now().isoformat()),
+               VALUES ($1, $2, $3, $4, $5, $6) RETURNING id""",
+            mem.content, mem.memory_type, mem.confidence,
+            mem.source_episode_ids, _vec(mem.embedding), mem.valid_from,
         )
-        db.commit()
-        return cur.lastrowid
 
     async def search_memories(
         self,
@@ -285,101 +123,109 @@ class Store:
         query_text: str | None = None,
         vector_weight: float = 0.7,
     ) -> list[dict]:
-        """Search memories by cosine similarity (numpy, no pgvector)."""
-        db = self._ensure_db()
-        rows = db.execute(
-            "SELECT * FROM memories WHERE valid_until IS NULL"
-        ).fetchall()
+        """Hybrid search: vector similarity + BM25 keyword matching.
 
-        if not rows:
-            return []
+        When query_text is provided, combines pgvector cosine distance with
+        ts_rank full-text score using Reciprocal Rank Fusion (RRF).  This
+        catches jargon / keyword matches that pure vector search misses.
 
-        # Score each memory by cosine similarity
-        scored = []
-        for row in rows:
-            d = dict(row)
-            sim = _cosine_similarity(embedding, d.get("embedding"))
-            d["distance"] = 1.0 - sim
-            d["similarity"] = sim
+        When query_text is None, falls back to pure vector search.
+        """
+        if query_text is None:
+            rows = await self.pool.fetch(
+                """SELECT *, embedding <=> $1::vector AS distance
+                   FROM memories WHERE valid_until IS NULL
+                   ORDER BY distance ASC LIMIT $2""",
+                _vec(embedding), limit,
+            )
+            return [dict(r) for r in rows]
 
-            # Keyword boost if query_text provided
-            if query_text:
-                content_lower = (d.get("content") or "").lower()
-                query_lower = query_text.lower()
-                keyword_hits = sum(1 for word in query_lower.split() if word in content_lower)
-                keyword_score = keyword_hits / max(len(query_lower.split()), 1)
-                d["score"] = vector_weight * sim + (1 - vector_weight) * keyword_score
-            else:
-                d["score"] = sim
-
-            scored.append(d)
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        # Hybrid: RRF fusion of vector rank + keyword rank
+        keyword_weight = 1.0 - vector_weight
+        rows = await self.pool.fetch(
+            """WITH vector_ranked AS (
+                 SELECT *, embedding <=> $1::vector AS vec_dist,
+                        ROW_NUMBER() OVER (ORDER BY embedding <=> $1::vector ASC) AS vec_rank
+                 FROM memories WHERE valid_until IS NULL
+                 ORDER BY vec_dist ASC LIMIT $2 * 3
+               ),
+               keyword_ranked AS (
+                 SELECT id,
+                        ts_rank_cd(to_tsvector('english', content), plainto_tsquery('english', $3)) AS kw_score,
+                        ROW_NUMBER() OVER (
+                          ORDER BY ts_rank_cd(to_tsvector('english', content), plainto_tsquery('english', $3)) DESC
+                        ) AS kw_rank
+                 FROM memories WHERE valid_until IS NULL
+                   AND to_tsvector('english', content) @@ plainto_tsquery('english', $3)
+               )
+               SELECT v.*,
+                      v.vec_dist AS distance,
+                      COALESCE(k.kw_score, 0) AS kw_score,
+                      ($4::float / (60 + v.vec_rank) + $5::float / (60 + COALESCE(k.kw_rank, 1000))) AS rrf_score
+               FROM vector_ranked v
+               LEFT JOIN keyword_ranked k ON v.id = k.id
+               ORDER BY rrf_score DESC
+               LIMIT $2""",
+            _vec(embedding), limit, query_text, vector_weight, keyword_weight,
+        )
+        return [dict(r) for r in rows]
 
     async def invalidate_memory(self, memory_id: int) -> None:
-        db = self._ensure_db()
-        db.execute(
-            "UPDATE memories SET valid_until = datetime('now'), updated_at = datetime('now') WHERE id = ?",
-            (memory_id,),
+        await self.pool.execute(
+            """UPDATE memories SET valid_until = NOW(), updated_at = NOW() WHERE id = $1""",
+            memory_id,
         )
-        db.commit()
 
     # --- Entities + Relations ---
 
     async def upsert_entity(self, entity: Entity) -> int:
-        db = self._ensure_db()
-        cur = db.execute(
-            """INSERT INTO entities (name, entity_type, embedding) VALUES (?, ?, ?)
-               ON CONFLICT(name) DO UPDATE SET entity_type = ?, embedding = ?""",
-            (entity.name, entity.entity_type, _vec_to_bytes(entity.embedding),
-             entity.entity_type, _vec_to_bytes(entity.embedding)),
+        return await self.pool.fetchval(
+            """INSERT INTO entities (name, entity_type, embedding)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (name) DO UPDATE SET entity_type = $2, embedding = $3
+               RETURNING id""",
+            entity.name, entity.entity_type, _vec(entity.embedding),
         )
-        db.commit()
-        if cur.lastrowid:
-            return cur.lastrowid
-        row = db.execute("SELECT id FROM entities WHERE name = ?", (entity.name,)).fetchone()
-        return row["id"] if row else 0
 
     async def insert_relation(self, rel: Relation) -> int:
-        db = self._ensure_db()
-        cur = db.execute(
+        return await self.pool.fetchval(
             """INSERT INTO relations (subject_id, predicate, object_id, confidence, source_memory_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            (rel.subject_id, rel.predicate, rel.object_id, rel.confidence, rel.source_memory_id),
+               VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+            rel.subject_id, rel.predicate, rel.object_id,
+            rel.confidence, rel.source_memory_id,
         )
-        db.commit()
-        return cur.lastrowid
 
     async def get_entity_relations(self, entity_id: int, depth: int = 2) -> list[dict]:
-        db = self._ensure_db()
-        # Simple non-recursive query for SQLite (recursive CTEs supported but keep simple)
-        rows = db.execute(
-            """SELECT r.*, e.name AS object_name, e.entity_type AS object_type
-               FROM relations r JOIN entities e ON r.object_id = e.id
-               WHERE r.subject_id = ? AND r.valid_until IS NULL""",
-            (entity_id,),
-        ).fetchall()
+        rows = await self.pool.fetch(
+            """WITH RECURSIVE graph AS (
+                 SELECT r.*, 1 AS depth FROM relations r
+                 WHERE r.subject_id = $1 AND r.valid_until IS NULL
+                 UNION ALL
+                 SELECT r.*, g.depth + 1 FROM relations r
+                 JOIN graph g ON r.subject_id = g.object_id
+                 WHERE g.depth < $2 AND r.valid_until IS NULL
+               )
+               SELECT g.*, e.name AS object_name, e.entity_type AS object_type
+               FROM graph g JOIN entities e ON g.object_id = e.id""",
+            entity_id, depth,
+        )
         return [dict(r) for r in rows]
 
     # --- Tasks ---
 
     async def insert_task(self, task: Task) -> None:
-        db = self._ensure_db()
-        db.execute(
+        await self.pool.execute(
             """INSERT INTO tasks (task_id, title, type, origin, status, priority, visibility,
                owner, created_by, brief, success_criteria, constraints, artifacts_expected,
                budget_class, cloud_budget_limit, dispatch_target, repo_path, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (task.task_id, task.title, task.type, task.origin, task.status,
-             task.priority, task.visibility, task.owner, task.created_by,
-             task.brief, json.dumps(task.success_criteria), json.dumps(task.constraints),
-             json.dumps(task.artifacts_expected), task.budget_class,
-             task.cloud_budget_limit, task.dispatch_target, task.repo_path,
-             task.created_at or datetime.now().isoformat(),
-             task.updated_at or datetime.now().isoformat()),
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)""",
+            task.task_id, task.title, task.type, task.origin, task.status,
+            task.priority, task.visibility, task.owner, task.created_by,
+            task.brief, json.dumps(task.success_criteria), json.dumps(task.constraints),
+            json.dumps(task.artifacts_expected), task.budget_class,
+            task.cloud_budget_limit, task.dispatch_target, task.repo_path,
+            task.created_at, task.updated_at,
         )
-        db.commit()
 
     _TASK_UPDATABLE = frozenset({
         "status", "priority", "verdict", "result_summary", "error_message",
@@ -388,42 +234,39 @@ class Store:
     })
 
     async def update_task_status(self, task_id: str, status: str, **kwargs) -> None:
-        db = self._ensure_db()
-        sets = ["status = ?", "updated_at = datetime('now')"]
-        params: list[Any] = [status]
+        sets = ["status = $2", "updated_at = NOW()"]
+        params: list[Any] = [task_id, status]
+        i = 3
         for key, val in kwargs.items():
             if key not in self._TASK_UPDATABLE:
                 raise ValueError(f"Column not allowed for update: {key}")
-            sets.append(f"{key} = ?")
+            sets.append(f"{key} = ${i}")
             params.append(val)
-        params.append(task_id)
-        db.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE task_id = ?", params)
-        db.commit()
+            i += 1
+        await self.pool.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE task_id = $1", *params,
+        )
 
     async def get_task(self, task_id: str) -> dict | None:
-        db = self._ensure_db()
-        row = db.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        row = await self.pool.fetchrow("SELECT * FROM tasks WHERE task_id = $1", task_id)
         return dict(row) if row else None
 
     async def get_active_tasks(self) -> list[dict]:
-        db = self._ensure_db()
-        rows = db.execute(
+        rows = await self.pool.fetch(
             """SELECT * FROM tasks WHERE status NOT IN ('done', 'failed', 'cancelled')
                ORDER BY priority DESC, created_at ASC""",
-        ).fetchall()
+        )
         return [dict(r) for r in rows]
 
     # --- Notes ---
 
     async def insert_note(self, note: Note) -> None:
-        db = self._ensure_db()
-        db.execute(
+        await self.pool.execute(
             """INSERT INTO notes (note_id, content, type, status, priority, source, owner, visibility, confidence)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (note.note_id, note.content, note.type, note.status,
-             note.priority, note.source, note.owner, note.visibility, note.confidence),
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+            note.note_id, note.content, note.type, note.status,
+            note.priority, note.source, note.owner, note.visibility, note.confidence,
         )
-        db.commit()
 
     _NOTE_UPDATABLE = frozenset({
         "status", "content", "type", "priority", "source", "owner",
@@ -431,144 +274,120 @@ class Store:
     })
 
     async def update_note_status(self, note_id: str, status: str, **kwargs) -> None:
-        db = self._ensure_db()
-        sets = ["status = ?", "updated_at = datetime('now')"]
-        params: list[Any] = [status]
+        sets = ["status = $2", "updated_at = NOW()"]
+        params: list[Any] = [note_id, status]
+        i = 3
         for key, val in kwargs.items():
             if key not in self._NOTE_UPDATABLE:
                 raise ValueError(f"Column not allowed for update: {key}")
-            sets.append(f"{key} = ?")
+            sets.append(f"{key} = ${i}")
             params.append(val)
-        params.append(note_id)
-        db.execute(f"UPDATE notes SET {', '.join(sets)} WHERE note_id = ?", params)
-        db.commit()
+            i += 1
+        await self.pool.execute(
+            f"UPDATE notes SET {', '.join(sets)} WHERE note_id = $1", *params,
+        )
 
     async def get_active_notes(self) -> list[dict]:
-        db = self._ensure_db()
-        rows = db.execute(
-            "SELECT * FROM notes WHERE status NOT IN ('archived') ORDER BY created_at DESC LIMIT 50",
-        ).fetchall()
+        rows = await self.pool.fetch(
+            """SELECT * FROM notes WHERE status NOT IN ('archived')
+               ORDER BY created_at DESC LIMIT 50""",
+        )
         return [dict(r) for r in rows]
 
     # --- Decision Events ---
 
     async def insert_decision_event(self, event_dict: dict) -> None:
-        db = self._ensure_db()
-        ts = event_dict.get("timestamp", datetime.now().isoformat())
-        if isinstance(ts, datetime):
-            ts = ts.isoformat()
-        db.execute(
+        ts = event_dict["timestamp"]
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts)
+        await self.pool.execute(
             """INSERT INTO decision_events (event_id, timestamp, sequence_num, source, classification, decision, execution, budget, meta)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (event_dict["event_id"], ts, event_dict["sequence_num"],
-             json.dumps(event_dict["source"]), json.dumps(event_dict["classification"]),
-             json.dumps(event_dict["decision"]), json.dumps(event_dict.get("execution")),
-             json.dumps(event_dict.get("budget")), json.dumps(event_dict.get("meta"))),
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+            event_dict["event_id"], ts, event_dict["sequence_num"],
+            json.dumps(event_dict["source"]), json.dumps(event_dict["classification"]),
+            json.dumps(event_dict["decision"]), json.dumps(event_dict.get("execution")),
+            json.dumps(event_dict.get("budget")), json.dumps(event_dict.get("meta")),
         )
-        db.commit()
 
     # --- Journal ---
 
     async def insert_journal(self, entry: JournalEntry) -> None:
-        db = self._ensure_db()
-        db.execute(
+        await self.pool.execute(
             """INSERT INTO journal (timestamp, action_type, action_summary, task_id, agent, band, budget_impact, rollback_hint, state_before, state_after, details)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (entry.timestamp or datetime.now().isoformat(), entry.action_type, entry.action_summary,
-             entry.task_id, entry.agent, entry.band,
-             json.dumps(entry.budget_impact) if entry.budget_impact else None,
-             entry.rollback_hint, entry.state_before, entry.state_after,
-             json.dumps(entry.details) if entry.details else None),
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+            entry.timestamp, entry.action_type, entry.action_summary,
+            entry.task_id, entry.agent, entry.band,
+            json.dumps(entry.budget_impact), entry.rollback_hint,
+            entry.state_before, entry.state_after, json.dumps(entry.details),
         )
-        db.commit()
 
     async def get_journal_today(self) -> list[dict]:
-        db = self._ensure_db()
-        today = date.today().isoformat()
-        rows = db.execute(
-            "SELECT * FROM journal WHERE timestamp >= ? ORDER BY timestamp ASC",
-            (today,),
-        ).fetchall()
+        rows = await self.pool.fetch(
+            """SELECT * FROM journal WHERE timestamp >= CURRENT_DATE ORDER BY timestamp ASC""",
+        )
         return [dict(r) for r in rows]
 
     async def get_cloud_tokens_today(self) -> int:
-        db = self._ensure_db()
-        today = date.today().isoformat()
-        row = db.execute(
-            """SELECT COALESCE(SUM(json_extract(budget_impact, '$.cloud_tokens')), 0) AS total
-               FROM journal WHERE timestamp >= ? AND budget_impact IS NOT NULL""",
-            (today,),
-        ).fetchone()
+        row = await self.pool.fetchrow(
+            """SELECT COALESCE(SUM((budget_impact->>'cloud_tokens')::int), 0) AS total
+               FROM journal WHERE timestamp >= CURRENT_DATE AND budget_impact IS NOT NULL""",
+        )
         return row["total"] if row else 0
 
     # --- Outbox ---
 
     async def insert_outbox(self, event: OutboxEvent) -> int:
-        db = self._ensure_db()
-        cur = db.execute(
+        return await self.pool.fetchval(
             """INSERT INTO outbox_events (decision_event_id, event_type, payload, status, visible_at)
-               VALUES (?,?,?,?,?)""",
-            (event.decision_event_id, event.event_type,
-             json.dumps(event.payload), event.status,
-             event.visible_at or datetime.now().isoformat()),
+               VALUES ($1,$2,$3,$4,$5) RETURNING id""",
+            event.decision_event_id, event.event_type,
+            json.dumps(event.payload), event.status, event.visible_at,
         )
-        db.commit()
-        return cur.lastrowid
 
     async def fetch_pending_outbox(self, batch: int = 50) -> list[dict]:
-        db = self._ensure_db()
-        now = datetime.now().isoformat()
-        rows = db.execute(
+        rows = await self.pool.fetch(
             """SELECT * FROM outbox_events
-               WHERE status = 'pending' AND visible_at <= ?
-               ORDER BY created_at ASC LIMIT ?""",
-            (now, batch),
-        ).fetchall()
+               WHERE status = 'pending' AND visible_at <= NOW()
+               ORDER BY created_at ASC LIMIT $1""",
+            batch,
+        )
         return [dict(r) for r in rows]
 
     async def mark_outbox_processed(self, outbox_id: int) -> None:
-        db = self._ensure_db()
-        db.execute(
-            "UPDATE outbox_events SET status = 'processed', processed_at = datetime('now') WHERE id = ?",
-            (outbox_id,),
+        await self.pool.execute(
+            """UPDATE outbox_events SET status = 'processed', processed_at = NOW() WHERE id = $1""",
+            outbox_id,
         )
-        db.commit()
 
     async def bump_outbox_attempt(self, outbox_id: int, error: str) -> None:
-        db = self._ensure_db()
-        db.execute(
+        await self.pool.execute(
             """UPDATE outbox_events
-               SET attempt = attempt + 1, error = ?,
-                   visible_at = datetime('now', '+' || (attempt * 30) || ' seconds'),
+               SET attempt = attempt + 1, error = $2,
+                   visible_at = NOW() + (attempt * interval '30 seconds'),
                    status = CASE WHEN attempt + 1 >= max_attempts THEN 'failed' ELSE 'pending' END
-               WHERE id = ?""",
-            (error, outbox_id),
+               WHERE id = $1""",
+            outbox_id, error,
         )
-        db.commit()
 
     # --- Sessions ---
 
     async def create_session(self, session_id: str) -> None:
-        db = self._ensure_db()
-        db.execute(
-            "INSERT OR IGNORE INTO sessions (session_id) VALUES (?)",
-            (session_id,),
+        await self.pool.execute(
+            "INSERT INTO sessions (session_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            session_id,
         )
-        db.commit()
 
     async def end_session(self, session_id: str) -> None:
-        db = self._ensure_db()
-        db.execute(
-            "UPDATE sessions SET ended_at = datetime('now') WHERE session_id = ?",
-            (session_id,),
+        await self.pool.execute(
+            "UPDATE sessions SET ended_at = NOW() WHERE session_id = $1",
+            session_id,
         )
-        db.commit()
 
     # --- Health check ---
 
     async def health_check(self) -> bool:
         try:
-            self._ensure_db().execute("SELECT 1")
+            await self.pool.fetchval("SELECT 1")
             return True
         except Exception:
             return False

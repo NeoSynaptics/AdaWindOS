@@ -300,16 +300,17 @@ class VoicePipeline:
             ),
         )
 
-        # --- TTS: VibeVoice Realtime 0.5B (streaming, ~2-3GB VRAM) with Kokoro fallback ---
+        # --- TTS: Cloud (Microsoft Azure) with Kokoro CPU fallback ---
         try:
-            tts = VibeVoiceTtsService(
-                model_id="microsoft/VibeVoice-Realtime-0.5B",
-                voice_preset="en-Emma_woman",
-                device="cuda:0",
+            from .cloud_tts import CloudTtsService
+            tts = CloudTtsService(
+                speech_key=getattr(self._config.tts, 'azure_speech_key', ''),
+                speech_region=getattr(self._config.tts, 'azure_speech_region', 'eastus'),
+                voice=getattr(self._config.tts, 'azure_voice', 'en-US-AvaMultilingualNeural'),
             )
-            log.info("TTS: VibeVoice Realtime 0.5B (GPU, streaming)")
+            log.info("TTS: Microsoft Azure Cloud (neural voice)")
         except Exception as e:
-            log.warning(f"VibeVoice failed to init: {e} — falling back to Kokoro")
+            log.warning(f"Cloud TTS failed to init: {e} — falling back to Kokoro")
             tts = KokoroTTSService(
                 settings=KokoroTTSSettings(
                     voice="af_heart",
